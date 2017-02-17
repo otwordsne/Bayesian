@@ -1,0 +1,483 @@
+---
+title: "STAT 365 Project"
+subtitle: "Using Hidden Markov Models and Classification to Identify Stock Market Regimes""
+author: "Richard Chen"
+date: "December 6, 2016"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r, echo = FALSE}
+samplesPlot <- function(samples, var=1:ncol(samples), ind=NULL, burnin=NULL, width=7, height=4, legend=TRUE, legend.location='topright', traceplot=TRUE, densityplot=TRUE) {
+    if(inherits(try(knitr::opts_chunk$get('dev'), silent=TRUE), 'try-error') || is.null(knitr::opts_chunk$get('dev')))   ## if called from Rmarkdown/knitr
+        dev.new(height=height, width=width)
+    par.save <- par(no.readonly = TRUE)
+    par(mfrow=c(1,traceplot+densityplot), cex=0.7, cex.main=1.5, cex.axis=0.9, lab=c(3,3,7), mgp=c(0,0.4,0), mar=c(1.6,1.6,2,0.6), oma=c(0,0,0,0), tcl=-0.3, bty='l')
+    ## process samples
+    samples <- samples[, var, drop=FALSE]
+    if(!is.null(ind) && !is.null(burnin)) stop('only specify either ind or burnin')
+    if(!is.null(ind))     samples <- samples[ind, , drop=FALSE]
+    if(!is.null(burnin))  samples <- samples[(burnin+1):dim(samples)[1], , drop=FALSE]
+    nparam <- ncol(samples)
+    rng <- range(samples)
+    if(!traceplot & !densityplot) stop('both traceplot and densityplot are false')
+    if(traceplot) {  ## traceplot
+        plot(1:nrow(samples), ylim=rng, type='n', main='Traceplots', xlab='', ylab='')
+        for(i in 1:nparam)
+            lines(samples[,i], col=rainbow(nparam, alpha=0.75)[i])
+        if(legend & !densityplot & !is.null(dimnames(samples)) & is.character(dimnames(samples)[[2]]))
+            legend(legend=dimnames(samples)[[2]], fill=rainbow(nparam, alpha=0.5), bty='n', x=legend.location)
+    }  ## finish traceplot
+    if(densityplot) {  ## denstyplot
+        xMin <- xMax <- yMax <- NULL
+        for(i in 1:nparam) {
+            d <- density(samples[,i])
+            xMin <- min(xMin,d$x); xMax <- max(xMax,d$x); yMax <- max(yMax, d$y) }
+        plot(1, xlim=c(xMin,xMax), ylim=c(0,yMax), type='n', main='Posterior Densities', xlab='', ylab='', yaxt='n')
+        for(i in 1:nparam)
+            polygon(density(samples[,i]), col=rainbow(nparam, alpha=0.2)[i], border=rainbow(nparam, alpha=0.2)[i])
+        if(legend & !is.null(dimnames(samples)) & is.character(dimnames(samples)[[2]]))
+            legend(legend=dimnames(samples)[[2]], fill=rainbow(nparam, alpha=0.5), bty='n', x=legend.location)
+    }  ## finish densityplot
+    invisible(par(par.save))
+}
+```
+
+```{r}
+#load libraries
+library(plyr)
+library('nimble')
+library('coda')
+
+#S&P 500 data from January 1, 1990 to December 31, 2015
+sp500 <- read.csv('/Users/williamsuser/Downloads/sp500.csv')
+sp500 <- read.csv('/Users/rdc4/Downloads/sp500.csv')
+sp500 <- read.csv('/Users/rdc4/Documents/sp500.csv')
+
+head(sp500)
+tail(sp500)
+t <- arrange(sp500,(sp500$Date))
+#sp500$pct_change_close 
+temp <- data.frame(diff(as.matrix(t[,2:7])))
+head(temp)
+dim(temp)
+dim(t)
+dim(sp500)
+t <- t[2:dim(t)[1],1:7]
+sp500 <- t
+
+pct_change <- temp/sp500[,2:7]
+sp500_pct_change <- cbind(t[,1],pct_change)
+colnames(sp500_pct_change) <- c('date','open_pct_change','high_pct_change','low_pct_change','close_pct_change','vol_pct_change','adj.close_pct_change')
+close_change <- sp500_pct_change$close_pct_change
+head(sp500_pct_change)
+
+
+#plot(temp$open_pct_change, type = 'l')
+#data <- cbind(sp500_ts[,1],pct_change[,1:6])
+#colnames(data) <- c('date','open_pct_change','high_pct_change','low_pct_change','close_pct_change','vol_pct_change','adj.close_pct_change')
+
+date <- t[,1]
+#plot the volatility in close prices vs time
+#plot(y = sp500_pct_change[,5], x = sp500_pct_change[,1], type = 'l')
+#hist(data[,5], breaks = 100)
+
+#par(mfrow = c(2,2))
+#plot(y = data[,2], x = data[,1], type = 'l')
+#plot(y = data[,3], x = data[,1], type = 'l')
+##plot(y = data[,4], x = data[,1], type = 'l')
+#plot(y = data[,5], x = data[,1], type = 'l')
+
+#par(mfrow = c(2,2))
+#plot(y = sp500[,2], x = sp500[,1], type = 'l')
+#plot(y = sp500[,3], x = sp500[,1], type = 'l')
+#plot(y = sp500[,4], x = sp500[,1], type = 'l')
+#plot(y = sp500[,5], x = sp500[,1], type = 'l')
+weeks <- dim(sp500)[1] / 5 #num of weeks, this is to get a changing volatility by week
+days <- dim(sp500_pct_change)[1]
+code <- nimbleCode({
+  #transition probabilities for going from 1 to 1, 0 to 0. State 0 is bear market. State 1 is bull market
+  p01 ~ dunif(0,1)
+  p11 ~ dunif(0,1)
+  p00 <- 1 - p01
+  p10 <- 1- p11
+  p ~ dunif(0,1)
+  
+  b0 ~ dnorm(0, sd = 10000)
+  bbull ~ dnorm(0, sd = 10000)
+  
+  #for (i in 1:weeks)
+  #sigma ~ dunif(0,20000) 
+  sigma0 ~ dunif(0,10000)#different sigmas for different states
+  sigma1 ~ dunif(0,10000)
+  
+  #1/1/1986
+  #x[1] <- 1
+  x[1] ~ dbinom(size=1, prob = p)
+  y[1] ~ dnorm(b0 + bbull*x[1], sd = sigma1*x[1] + (1-x[1])*sigma0)#sigma1*x[1] + (1-x[1])*sigma0)
+  
+
+    #start at 2, because we saw first already in above line
+    for (t in 2:days){
+      x[t] ~ dbinom(size = 1, prob = p11*x[t-1] + (1-x[t-1])*p01)
+      y[t] ~ dnorm(b0 + bbull*x[t], sd = sigma1*x[t] + (1-x[t])*sigma0)
+    }
+  
+})
+constants <- list(days = days)
+data <- list(y = sp500_pct_change$close_pct_change) # name of thing in model, y, is given data of sightings
+inits <- list(x = array(1, days), p01 = .5, p11 = .5, b0 = 0, bbull =0, sigma0 = 1, sigma1 = 1, p = .5)
+Rmodel <- nimbleModel(code, constants, data, inits)
+
+Rmodel$calculate() #If we get a number, means that everything in the model is fine
+
+conf <- configureMCMC(Rmodel)
+#expect binary samplers for discrete things, the latent states, 145 * 9. RW samplers on phi and p
+conf$addMonitors(c('p00','p10'))
+conf$printSamplers('p01')
+
+conf$getMonitors() #don't want monitors on x's. There aren't bc no prior on x
+
+
+
+Rmcmc <- buildMCMC(conf)
+Cmodel <- compileNimble(Rmodel)
+Cmcmc <- compileNimble(Rmcmc, project = Cmodel)
+
+#set.seed(0)
+samples <- runMCMC(Cmcmc, 50000)
+apply(samples_temp[2000:10000,],2,mean)
+apply(samples_temp[2000:10000,],2,effectiveSize)
+#samples <- runMCMC(Cmcmc, 100000)
+burnin_samples <- samples[20000:150000,]
+save(burnin_samples, file='/Users/williamsuser/Documents/burnin_samples.rda')
+#load('/Users/rdc4/Documents/my.coda.samples.rda')
+#library('coda')
+
+codaSamples <- runMCMC(Cmcmc, 120000, nburnin = 20000, nchains = 3, returnCodaMCMC = TRUE)
+save(codaSamples, file='/Users/williamsuser/Documents/my.coda.samples2.rda')
+save(codaSamples, file='/Users/rdc4/Documents/my.coda.samples2.rda')
+load(file='/Users/williamsuser/Documents/my.coda.samples.rda')
+load(file='/Users/rdc4/Documents/my.coda.samples.rda')
+
+cor(codaSamples[[1]])
+
+#before the problem was that codaSamples had the derived values p00 and p10, so that some correlations were -1
+codaSamp_wo_derived <- mcmc.list(codaSamples[[1]][,c(1:3,5,7,8,9)], codaSamples[[2]][,c(1:3,5,7,8,9)], codaSamples[[3]][,c(1:3,5,7,8,9)])
+
+
+#ASSESS CONVERGENCE
+gelman.diag(codaSamp_wo_derived)
+```
+Now we asses the convergence of the MCMC chains using the Gelman diagnostic. For each of the variables, the point estimate of the Gelman diagnostic is very close to 1
+```{r}
+apply(codaSamples[[1]],2,mean)
+
+
+p01_mean <- mean(samples[,5])
+p01_sd <- sd(samples[,5])
+p11_mean <- mean(samples[,7])
+p11_sd <- sd(samples[,7])
+p_mean <- mean(samples[,3])
+p_sd <- sd(samples[,3])
+
+load(file='/Users/williamsuser/Documents/my.coda.samples.rda')
+load(file='/Users/rdc4/Documents/my.coda.samples.rda')
+
+#mean of sd of the transition probabilities to bull state
+p01_mean <- mean(codaSamples[[1]][,5])
+p01_sd <- sd(codaSamples[[1]][,5])
+p11_mean <- mean(codaSamples[[1]][,7])
+p11_sd <- sd(codaSamples[[1]][,7])
+p_mean <- mean(codaSamples[[1]][,3])
+p_sd <- sd(codaSamples[[1]][,3])
+estimates <- c(p01_mean,p01_sd,p11_mean,p11_sd,p_mean,p_sd)
+```
+```{r}
+
+
+#save and load the coda object
+#load('/Users/rdc4/Documents/my.coda.samples.rda')
+
+```
+
+I now have the transition probabilities.
+Now make a model where the 2 params are the means of normal distribution of the markets and the sp500 is the realization of the normal distribution
+
+```{r}
+samp <- read.csv(file = "/Users/rdc4/Documents/sp500_samples_init1.csv")
+samp <- samp[,2:7]
+head(samp)
+apply(samp,2,mean)
+apply(samp[15000:200000,],2,mean)
+apply(samp[15000:200000,],2,effectiveSize)
+apply(samp[15000:200000,],2,BCI)
+apply(samp[15000:200000,],2,sd)
+samplesPlot(samp, var='p01', ind = 15000:200000)
+```
+The transition probabilities: 
+
+$p_{01}$: mean: .7686. 95% BCI: $(.6736, .8909)$
+$p_{11}$: mean: .9899. 95% BCI: $(.9864, .9929)$
+
+
+```{r}
+#sp500_cleaned = read.csv('/Users/rdc4/Documents/sp500_1990_cleaned.csv')
+sp500_realization <- read.csv('/Users/rdc4/Documents/sp500_1990_cleaned.csv')[,c(3:9,13)]
+years <- c(1990:2015)
+years <- sapply(years, as.character)
+temp <- sp500_realization[,1:2]
+temp$Open <- temp$
+dates <- as.Date(sp500_realization$Date)
+dates <- getYear(dates)
+sp500_realization$Year <- as.numeric(dates)
+deflate_prices <- 1/worth
+
+
+
+
+hist(sp500_realization$Close)
+
+#DETREND based on 5 years to get rid of some of effects of inflation
+install.packages('fpp')
+library('fpp')
+plot(as.ts(sp500_realization[,5]))
+library('forecast')
+trend_sp500 = ma(sp500_realization[,5], order = 252, centre = TRUE)
+trend_sp500 = ma(sp500_realization[,5], order = 252*5, centre = TRUE)
+lines(trend_sp500)
+
+detrend_sp500 = sp500_realization[,5] - trend_sp500
+lines(1000+detrend_sp500)
+sp500_realization$detrend_close <- detrend_sp500
+sp500_no5trend <- na.omit(sp500_realization)
+plot(y = sp500_no5trend$detrend_close, x = sp500_no5trend$Date)
+
+ts_sp500 = ts(sp500_realization[,5], frequency = 252)
+decompose_sp500 <- decompose(ts_sp500, 'additive')
+plot(as.ts(decompose_sp500$seasonal))
+plot(as.ts(decompose_sp500$trend))
+plot(as.ts(decompose_sp500$random))
+
+plot(as.ts(trend_sp500))
+head(trend_sp500)
+head(sp500_realization)
+
+days <- dim(sp500_no5trend)[1]
+
+###USED THIS CODE TO GET SAMPLES 
+sp500_realization <- read.csv('/Users/rdc4/Documents/sp500_1990_cleaned.csv')[,c(3:8,13)]
+days <- dim(sp500_realization)[1]
+#maybe add in fixed effect for year?
+code2 <- nimbleCode({
+  #the priors for S&P500 prices
+  mu_bull ~ dnorm(0, sd = 10000) #bull
+  mu_bear ~ dnorm(0, sd = 10000) #bear market
+  
+  sigma_bull ~ dunif(0, 10000) #bull
+  sigma_bear ~ dunif(0, 10000) #bear
+  
+  #transition probabilities for going from 1 to 1, 0 to 1. 
+  p01 ~ dbeta(mean = p01_mean, sd = p01_sd) #before used sd = p01_sd. Should be this, because I got this from samples
+  p11 ~ dbeta(mean = p11_mean, sd = p11_sd)
+  prob_bull ~ dbeta(mean = p_mean, sd = p_sd)
+  #con ~ dconstraint(mu_bear < mu_bull) #assumption that average of sp500 is higher in bull than in bear
+  #p01con1 ~ dconstraint(p01_mean <= 1)
+  #p01con2 ~ dconstraint(p01_mean >= 0)
+  #p11con1 ~ dconstraint(p11_mean <= 1)
+  #p11con2 ~ dconstraint(p11_mean >= 0)
+  pcon1 ~ dconstraint(prob_bull <= 1)
+  pcon2 ~ dconstraint(prob_bull >= 0)
+  
+  z[1] ~ dbern(1)
+  means[1] <- equals(z[1],0)*mu_bear + equals(z[1],1)*mu_bull
+  sigmas[1] <- equals(z[1],0)*sigma_bear + equals(z[1],1)*sigma_bull
+  y[1] ~ dnorm(means[1], sd = sigmas[1])
+  
+  for (i in 2:days){
+    #latent states
+    z[i] ~ dbern(prob = (1-z[i-1])*p01 + z[i-1]*p11) # prob that y[i] is bull
+  
+    #means[i] <- equals(z[i],0)*mu_bear + equals(z[i],1)*mu_bull
+    #sigmas[i] <- equals(z[i],0)*sigma_bear + equals(z[i],1)*sigma_bull
+    means[i] <- equals(z[i],0)*mu_bear + equals(z[i],1)*mu_bull
+    sigmas[i] <- equals(z[i],0)*sigma_bear + equals(z[i],1)*sigma_bull
+    
+    y[i] ~ dnorm(means[i], sd = sigmas[i])
+  }
+})
+constants2 <- list(days = days, p01_mean= p01_mean, p11_mean= p11_mean, p01_sd= p01_sd, p11_sd= p11_sd, p_mean = p_mean, p_sd = p_sd)
+data2 <- list(y = close_change, pcon1 = 1, pcon2 = 1) # name of thing in model, y, is given data of sightings
+#
+inits2 <- list(z = array(1,days), mu_bull = 0.01, mu_bear = 0, sigma_bull = 1, sigma_bear = 1, prob_bull = p_mean, p01 = .5, p11 = .5)
+
+Rmodel2 <- nimbleModel(code = code2, constants = constants2, data = data2, inits = inits2)
+
+
+Rmodel2$calculate()
+conf2 <- configureMCMC(Rmodel2)
+#conf2$getMonitors()
+tail(conf2$printSamplers())
+#conf2$removeSamplers('y')
+#conf2$addMonitors('z')
+
+Rmcmc2 <- buildMCMC(conf2)
+Cmodel2 <- compileNimble(Rmodel2)
+Cmcmc2 <- compileNimble(Rmcmc2, project = Rmodel2)
+
+#model$setData(list(b0 = some val, b1 = some)
+samples_classify <- runMCMC(Cmcmc2, niter = 30000)
+save(samples_classify, file='/Users/williamsuser/Documents/samples_classified.rda')
+
+codaSamples_classify <- runMCMC(Cmcmc2, 120000, nburnin = 20000, nchains = 3, returnCodaMCMC = TRUE)
+save(codaSamples_classify, file='/Users/rdc4/Documents/my.coda.samples.classified2.rda')
+write.csv(codaSamples_classify[[1]], file='/Users/rdc4/Documents/samples.classified.csv')
+save(codaSamples_classify, file='/Users/williamsuser/Documents/my.coda.samples.classified.rda')
+
+load(file='/Users/williamsuser/Documents/my.coda.samples.classified.rda')
+
+#ASSESS CONVERGENCE
+codaSamples_classify_top_params<- mcmc.list(codaSamples_classify[[1]][,1:7], codaSamples_classify[[2]][,1:7], codaSamples_classify[[3]][,1:7])
+gelman.diag(codaSamples_classify_top_params)
+```
+The Gelman diagnostic shows us that the point estimates and upper CI's for all the top level parameters and the multivariate psrf are 1. Thus, we can conclude that the chains have converged.
+
+```{r}
+load(file='/Users/williamsuser/Documents/my.coda.samples.classified.rda')
+load(file='/Users/rdc4/Documents/my.coda.samples.classified.rda')
+class <- apply(codaSamples_classify[[1]][,8:dim(codaSamples_classify[[1]])[2]],2,mean)
+class <- apply(samples_classify[5000:30000,8:dim(samples_classify)[2]],2,mean)
+
+class <- apply(codaSamples_classify[[2]][,8:6559],2,mean)
+write.csv(samples_classify, file='/Users/rdc4/Documents/classified_samples.csv')
+top_lvl_params <- apply(codaSamples_classify[[1]][,1:7],2,mean)
+class1 <- apply(samples_classify[,8:6559],2,mean)
+class[class < .9]
+means <- apply(samples_classify[5000:20000,1:10], 2, mean)
+curve(dnorm(x, means[2], sd = means[7]), xlim = c(-.1,.1))
+curve(dnorm(x, means[1], sd = means[6]), xlim = c(-.1,.1), add = TRUE)
+
+#SHOWS THE LOW VOLATILITY OF BULL MARKETS AND HIGH VOLATILITY OF BEAR MARKETS
+save(samples_classify, file='/Users/rdc4/Documents/classified_samples.rda')
+write.csv(class, file='/Users/rdc4/Documents/classified_samples.csv')
+apply(codaSamples_classify[[1]][,1:9], 2,BCI)
+samplesPlot(samples_classify, var ='z[100]', ind = 3000:10000)
+
+save(class, file = '/Users/rdc4/Documents/classified_samples.csv')
+save(class, file = '/Users/rdc4/Documents/classified_samples.rda')
+class(class)
+#plot(samples_classify[,3])
+#plot(y = class, x= sp500_no5trend$Date, type = 'l')
+par(mfrow=(1,2))
+plot(class, type = 'l')
+plot(class1, type = 'l')
+plot(y = class, x = sp500_pct_change$date[1:6551], type = 'l')
+class1 <- 1-class
+
+plot(class1, type = 'l')
+plot(y = class1, x = sp500_pct_change$date, type = 'l')
+```
+
+#Plot the probs
+```{r}
+dates <- as.Date(sp500_pct_change$date)
+tlab <- seq(dates[1], dates[length(dates)], by="year")
+lab <- format(tlab,format="%Y")
+x <- seq(1:length(dates))
+op <- par(mar=c(6,4,1,1))
+plot(x, class, t="l", xaxt="n", xlab="")
+axis(1, at=tlab, labels=TRUE)
+text(x=tlab, y=par()$usr[3]-0.1*(par()$usr[4]-par()$usr[3]),
+labels=lab, srt=90, adj=1, xpd=TRUE)
+par(op)
+
+
+op <- par(mar = c(7,4,4,2) + 0.1) ## more space for the labels
+plot(dates, class, xaxt = "n", ann = FALSE)
+labDates <- seq(as.Date("01/01/1990", format = "%d/%m/%Y"), tail(dates, 1),
+                by = "months")
+axis.Date(side = 1, dates, at = labDates, format = "%b %y", las = 2)
+title(ylab = "Probability of Bull Market") ## draw the axis labels
+title(xlab = "Date", line = 5) ## push this one down a bit in larger margin
+par(op)
+
+classified_df <- data.frame(cbind(sp500_pct_change$date, class))
+library('ggplot2')
+qplot(x = dates, class)
+lines(class)
+ggplot(class, aes(dates, class))
+```
+
+```{r}
+sp500_realization <- read.csv('/Users/rdc4/Documents/sp500_1990_cleaned.csv')[,c(3:8,13)]
+days <- dim(sp500_realization)[1]
+code2 <- nimbleCode({
+  #transition probabilities for going from 1 to 1, 0 to 0. 
+  mu0 ~ dnorm(0,sd=10000) #bear
+  mu1 ~ dnorm(0, sd = 10000) #bull market
+  
+  sigma0 ~ dunif(0, 10000) #bear
+  sigma1 ~ dunif(0,10000) #bull
+  
+  #the priors for
+  p01 ~ dnorm(mean = p01_mean, p01_sd)#sd = p01_sd)
+  p11 ~ dnorm(mean = p11_mean, p11_sd)#sd = p11_sd) 
+  con ~ dconstraint(mu0 < mu1) #average of sp500 is higher in bull than in bear, if use change dont use this cons
+  
+  z[1] ~ dbern(p_mean)
+  #p ~ dunif(0,1)
+  #z[1] ~ dbern(p)
+  for (i in 2:days){
+    z[i] ~ dbern(prob = (1-z[i-1])*.7686 + z[i-1]*.9899) # prob that is bull
+    
+    #these are dervied quantities
+    means[i] <- equals(z[i],0)*mu0 + equals(z[i],1)*mu1
+    
+    
+    sigmas[i] <- equals(z[i],0)*sigma0 + equals(z[i],1)*sigma1
+    
+    y[i] ~ dnorm(means[i], sd = sigmas[i]) #can I do fixed effect w/ dnorm(means[i] + yr[j], sd = sigmas[i])
+  }
+})
+constants2 <- list(days = days, p_mean = p_mean, p01_mean = p01_mean, p01_sd=p01_sd, p11_mean= p11_mean, p11_sd=p11_sd)
+data2 <- list(y = sp500_pct_change$Close, con = 1)
+inits2 <- list(z = array(1,days), mu0 = 0.1, mu1 = 0, sigma0 = 1, sigma1 = 1, p01 = p01_mean, p11 = p11_mean, means = array(0,days), sigmas = array(1,days))
+#z = array(1,days-1)
+#, means = array(0,days), sigmas = array(1,days)
+Rmodel2 <- nimbleModel(code2, constants2, data2, inits2)
+
+
+
+```
+dim(samples_classify)
+head(samples_classify[,1])
+apply(samples_classify[,1:9], 2, effectiveSize)
+head(colnames(samples_classify))
+
+
+
+```{r, include = FALSE}
+sp500_cleaned = read.csv('/Users/rdc4/Documents/sp500_1990_cleaned.csv')
+sp500_cleaned = sp500_cleaned[,c(3:8,12,13)]
+#Python code to clean my data for inflation
+worth=[.96,1,1.03,1.06,1.09,1.12,1.15,1.18,1.20,1.22,1.26,1.30,1.31,1.35,1.39,1.43,1.48,1.52,1.58,1.58,1.60,1.65,1.69,1.71,1.74,1.74]
+
+df['dt'] = pd.to_datetime(df['Date'])
+df['yr'] = df['dt'].dt.year
+d2000=df[df['yr']==2000]
+
+a=d2000['Close'].apply(lambda x: x/1.26)
+df.to_csv('/Users/rdc4/Documents/sp500_1990_cleaned.csv')
+
+```
+In this, I first use a state space model to estimate the transition probabilities, 
+
+```{r}
+apply(samples[20000:100000,1:8],2,effectiveSize)
+BCI <- function(x){
+  return(quantile(x,c(.025,.975)))
+}
+apply(samples[20000:150000,],2,BCI)
+```
